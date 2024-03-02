@@ -123,7 +123,7 @@ class Controller:
 
         for w_name, w_info in old_info.items():
             if not self.register_worker(
-                w_name, w_info.check_heart_beat, None, w_info.multimodal
+                w_name, w_info.check_heart_beat, {}, w_info.multimodal
             ):
                 logger.info(f"Remove stale worker: {w_name}")
 
