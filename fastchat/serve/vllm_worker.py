@@ -262,13 +262,6 @@ if __name__ == "__main__":
         "--conv-template", type=str, default=None, help="Conversation prompt template."
     )
     parser.add_argument(
-        "--trust_remote_code",
-        action="store_false",
-        default=True,
-        help="Trust remote code (e.g., from HuggingFace) when"
-        "downloading the model and tokenizer.",
-    )
-    parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
         default=0.9,
