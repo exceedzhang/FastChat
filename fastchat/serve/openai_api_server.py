@@ -22,10 +22,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 import httpx
 
-try:
-    from pydantic.v1 import BaseSettings
-except ImportError:
-    from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 import shortuuid
 import tiktoken
 import uvicorn
@@ -133,7 +130,7 @@ async def check_api_key(
 
 def create_error_response(code: int, message: str) -> JSONResponse:
     return JSONResponse(
-        ErrorResponse(message=message, code=code).dict(), status_code=400
+        ErrorResponse(message=message, code=code).model_dump(), status_code=400
     )
 
 
@@ -319,7 +316,9 @@ async def get_gen_params(
                         if item["type"] == "text"
                     ]
 
-                    text = "\n".join(text_list)
+                    # TODO(chris): This only applies to LLaVA model. Implement an image_token string in the conv template.
+                    text = "<image>\n" * len(image_list)
+                    text += "\n".join(text_list)
                     conv.append_message(conv.roles[0], (text, image_list))
                 else:
                     conv.append_message(conv.roles[0], message["content"])
@@ -477,8 +476,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
         )
         if "usage" in content:
-            task_usage = UsageInfo.parse_obj(content["usage"])
-            for usage_key, usage_value in task_usage.dict().items():
+            task_usage = UsageInfo.model_validate(content["usage"])
+            for usage_key, usage_value in task_usage.model_dump().items():
                 setattr(usage, usage_key, getattr(usage, usage_key) + usage_value)
 
     return ChatCompletionResponse(model=request.model, choices=choices, usage=usage)
@@ -610,12 +609,12 @@ async def create_completion(request: CompletionRequest):
                     finish_reason=content.get("finish_reason", "stop"),
                 )
             )
-            task_usage = UsageInfo.parse_obj(content["usage"])
-            for usage_key, usage_value in task_usage.dict().items():
+            task_usage = UsageInfo.model_validate(content["usage"])
+            for usage_key, usage_value in task_usage.model_dump().items():
                 setattr(usage, usage_key, getattr(usage, usage_key) + usage_value)
 
         return CompletionResponse(
-            model=request.model, choices=choices, usage=UsageInfo.parse_obj(usage)
+            model=request.model, choices=choices, usage=UsageInfo.model_validate(usage)
         )
 
 
@@ -749,7 +748,7 @@ async def create_embeddings(request: EmbeddingsRequest, model_name: str = None):
             total_tokens=token_num,
             completion_tokens=None,
         ),
-    ).dict(exclude_none=True)
+    ).model_dump(exclude_none=True)
 
 
 async def get_embedding(payload: Dict[str, Any]):
@@ -866,8 +865,8 @@ async def create_chat_completion(request: APIChatCompletionRequest):
                 finish_reason=content.get("finish_reason", "stop"),
             )
         )
-        task_usage = UsageInfo.parse_obj(content["usage"])
-        for usage_key, usage_value in task_usage.dict().items():
+        task_usage = UsageInfo.model_validate(content["usage"])
+        for usage_key, usage_value in task_usage.model_dump().items():
             setattr(usage, usage_key, getattr(usage, usage_key) + usage_value)
 
     return ChatCompletionResponse(model=request.model, choices=choices, usage=usage)

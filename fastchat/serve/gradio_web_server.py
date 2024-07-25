@@ -50,6 +50,14 @@ no_change_btn = gr.Button()
 enable_btn = gr.Button(interactive=True, visible=True)
 disable_btn = gr.Button(interactive=False)
 invisible_btn = gr.Button(interactive=False, visible=False)
+enable_text = gr.Textbox(
+    interactive=True, visible=True, placeholder="👉 Enter your prompt and press ENTER"
+)
+disable_text = gr.Textbox(
+    interactive=False,
+    visible=True,
+    placeholder='Press "🎲 New Round" to start over👇 (Note: Your vote shapes the leaderboard, please vote RESPONSIBLY!)',
+)
 
 controller_url = None
 enable_moderation = False
@@ -65,8 +73,10 @@ It must not be used for any illegal, harmful, violent, racist, or sexual purpose
 Please do not upload any private information.
 The service collects user dialogue data, including both text and images, and reserves the right to distribute it under a Creative Commons Attribution (CC-BY) or a similar license.
 
+#### Please report any bug or issue to our [Discord](https://discord.gg/HSWAKCrnFx)/arena-feedback.
+
 ### Acknowledgment
-We thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https://www.kaggle.com/), [MBZUAI](https://mbzuai.ac.ae/), [a16z](https://www.a16z.com/), [Together AI](https://www.together.ai/), [Hyperbolic](https://hyperbolic.xyz/), [Anyscale](https://www.anyscale.com/), [HuggingFace](https://huggingface.co/) for their generous [sponsorship](https://lmsys.org/donations/).
+We thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https://www.kaggle.com/), [MBZUAI](https://mbzuai.ac.ae/), [a16z](https://www.a16z.com/), [Together AI](https://www.together.ai/), [Hyperbolic](https://hyperbolic.xyz/), [RunPod](https://runpod.io), [Anyscale](https://www.anyscale.com/), [HuggingFace](https://huggingface.co/) for their generous [sponsorship](https://lmsys.org/donations/).
 
 <div class="sponsor-image-about">
     <img src="https://storage.googleapis.com/public-arena-asset/skylab.png" alt="SkyLab">
@@ -75,6 +85,7 @@ We thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https://ww
     <img src="https://storage.googleapis.com/public-arena-asset/a16z.jpeg" alt="a16z">
     <img src="https://storage.googleapis.com/public-arena-asset/together.png" alt="Together AI">
     <img src="https://storage.googleapis.com/public-arena-asset/hyperbolic_logo.png" alt="Hyperbolic">
+    <img src="https://storage.googleapis.com/public-arena-asset/runpod-logo.jpg" alt="RunPod">
     <img src="https://storage.googleapis.com/public-arena-asset/anyscale.png" alt="AnyScale">
     <img src="https://storage.googleapis.com/public-arena-asset/huggingface.png" alt="HuggingFace">
 </div>
@@ -98,20 +109,24 @@ api_endpoint_info = {}
 
 
 class State:
-    def __init__(self, model_name):
+    def __init__(self, model_name, is_vision=False):
         self.conv = get_conversation_template(model_name)
         self.conv_id = uuid.uuid4().hex
         self.skip_next = False
         self.model_name = model_name
         self.oai_thread_id = None
+        self.is_vision = is_vision
+
+        # NOTE(chris): This could be sort of a hack since it assumes the user only uploads one image. If they can upload multiple, we should store a list of image hashes.
+        self.has_csam_image = False
 
         self.regen_support = True
         if "browsing" in model_name:
             self.regen_support = False
-        self.init_system_prompt(self.conv)
+        self.init_system_prompt(self.conv, is_vision)
 
-    def init_system_prompt(self, conv):
-        system_prompt = conv.get_system_message()
+    def init_system_prompt(self, conv, is_vision):
+        system_prompt = conv.get_system_message(is_vision)
         if len(system_prompt) == 0:
             return
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -129,6 +144,9 @@ class State:
                 "model_name": self.model_name,
             }
         )
+
+        if self.is_vision:
+            base.update({"has_csam_image": self.has_csam_image})
         return base
 
 
@@ -139,13 +157,20 @@ def set_global_vars(controller_url_, enable_moderation_, use_remote_storage_):
     use_remote_storage = use_remote_storage_
 
 
-def get_conv_log_filename():
+def get_conv_log_filename(is_vision=False, has_csam_image=False):
     t = datetime.datetime.now()
-    name = os.path.join(LOGDIR, f"{t.year}-{t.month:02d}-{t.day:02d}-conv.json")
+    conv_log_filename = f"{t.year}-{t.month:02d}-{t.day:02d}-conv.json"
+    if is_vision and not has_csam_image:
+        name = os.path.join(LOGDIR, f"vision-tmp-{conv_log_filename}")
+    elif is_vision and has_csam_image:
+        name = os.path.join(LOGDIR, f"vision-csam-{conv_log_filename}")
+    else:
+        name = os.path.join(LOGDIR, conv_log_filename)
+
     return name
 
 
-def get_model_list(controller_url, register_api_endpoint_file, multimodal):
+def get_model_list(controller_url, register_api_endpoint_file, vision_arena):
     global api_endpoint_info
 
     # Add models from the controller
@@ -153,7 +178,7 @@ def get_model_list(controller_url, register_api_endpoint_file, multimodal):
         ret = requests.post(controller_url + "/refresh_all_workers")
         assert ret.status_code == 200
 
-        if multimodal:
+        if vision_arena:
             ret = requests.post(controller_url + "/list_multimodal_models")
             models = ret.json()["models"]
         else:
@@ -166,11 +191,12 @@ def get_model_list(controller_url, register_api_endpoint_file, multimodal):
     if register_api_endpoint_file:
         api_endpoint_info = json.load(open(register_api_endpoint_file))
         for mdl, mdl_dict in api_endpoint_info.items():
-            mdl_multimodal = mdl_dict.get("multimodal", False)
-            if multimodal and mdl_multimodal:
-                models += [mdl]
-            elif not multimodal and not mdl_multimodal:
-                models += [mdl]
+            mdl_vision = mdl_dict.get("vision-arena", False)
+            mdl_text = mdl_dict.get("text-arena", True)
+            if vision_arena and mdl_vision:
+                models.append(mdl)
+            if not vision_arena and mdl_text:
+                models.append(mdl)
 
     # Remove anonymous models
     models = list(set(models))
@@ -211,7 +237,7 @@ def load_demo(url_params, request: gr.Request):
 
     if args.model_list_mode == "reload":
         models, all_models = get_model_list(
-            controller_url, args.register_api_endpoint_file, False
+            controller_url, args.register_api_endpoint_file, vision_arena=False
         )
 
     return load_demo_single(models, url_params)
@@ -262,14 +288,14 @@ def regenerate(state, request: gr.Request):
         state.skip_next = True
         return (state, state.to_gradio_chatbot(), "", None) + (no_change_btn,) * 5
     state.conv.update_last_message(None)
-    return (state, state.to_gradio_chatbot(), "", None) + (disable_btn,) * 5
+    return (state, state.to_gradio_chatbot(), "") + (disable_btn,) * 5
 
 
 def clear_history(request: gr.Request):
     ip = get_ip(request)
     logger.info(f"clear_history. ip: {ip}")
     state = None
-    return (state, [], "", None) + (disable_btn,) * 5
+    return (state, [], "") + (disable_btn,) * 5
 
 
 def get_ip(request: gr.Request):
@@ -277,27 +303,14 @@ def get_ip(request: gr.Request):
         ip = request.headers["cf-connecting-ip"]
     elif "x-forwarded-for" in request.headers:
         ip = request.headers["x-forwarded-for"]
+        if "," in ip:
+            ip = ip.split(",")[0]
     else:
         ip = request.client.host
     return ip
 
 
-def _prepare_text_with_image(state, text, image):
-    if image is not None:
-        if len(state.conv.get_images()) > 0:
-            # reset convo with new image
-            state.conv = get_conversation_template(state.model_name)
-
-        image = state.conv.convert_image_to_base64(
-            image
-        )  # PIL type is not JSON serializable
-
-        text = text, [image]
-
-    return text
-
-
-def add_text(state, model_selector, text, image, request: gr.Request):
+def add_text(state, model_selector, text, request: gr.Request):
     ip = get_ip(request)
     logger.info(f"add_text. ip: {ip}. len: {len(text)}")
 
@@ -325,10 +338,9 @@ def add_text(state, model_selector, text, image, request: gr.Request):
         ) * 5
 
     text = text[:INPUT_CHAR_LEN_LIMIT]  # Hard cut-off
-    text = _prepare_text_with_image(state, text, image)
     state.conv.append_message(state.conv.roles[0], text)
     state.conv.append_message(state.conv.roles[1], None)
-    return (state, state.to_gradio_chatbot(), "", None) + (disable_btn,) * 5
+    return (state, state.to_gradio_chatbot(), "") + (disable_btn,) * 5
 
 
 def model_worker_stream_iter(
@@ -385,25 +397,6 @@ def is_limit_reached(model_name, ip):
     except Exception as e:
         logger.info(f"monitor error: {e}")
         return None
-
-
-def upload_image_file_to_gcs(image, filename):
-    from google.cloud import storage
-    import io
-
-    storage_client = storage.Client()
-    # upload file to GCS
-    bucket = storage_client.get_bucket("arena_user_content")
-
-    blob = bucket.blob(f"{filename}")
-    if not blob.exists():
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        buffer.seek(0)
-        blob.upload_from_file(buffer, content_type="image/png")
-
-    blob.make_public()
-    return blob.public_url
 
 
 def bot_response(
@@ -468,7 +461,6 @@ def bot_response(
         # Construct prompt.
         # We need to call it here, so it will not be affected by "▌".
         prompt = conv.get_prompt()
-
         # Set repetition_penalty
         if "t5" in model_name:
             repetition_penalty = 1.2
@@ -487,6 +479,11 @@ def bot_response(
             images,
         )
     else:
+        # Remove system prompt for API-based models unless specified
+        custom_system_prompt = model_api_dict.get("custom_system_prompt", False)
+        if not custom_system_prompt:
+            conv.set_system_message("")
+
         if use_recommended_config:
             recommended_config = model_api_dict.get("recommended_config", None)
             if recommended_config is not None:
@@ -517,8 +514,8 @@ def bot_response(
         for i, data in enumerate(stream_iter):
             if data["error_code"] == 0:
                 output = data["text"].strip()
-                # conv.update_last_message(output + "▌")
-                conv.update_last_message(output + html_code)
+                conv.update_last_message(output + "▌")
+                # conv.update_last_message(output + html_code)
                 yield (state, state.to_gradio_chatbot()) + (disable_btn,) * 5
             else:
                 output = data["text"] + f"\n\n(error_code: {data['error_code']})"
@@ -564,31 +561,13 @@ def bot_response(
     finish_tstamp = time.time()
     logger.info(f"{output}")
 
-    # We load the image because gradio accepts base64 but that increases file size by ~1.33x
-    loaded_images = [load_image(image) for image in images]
-    images_hash = [hashlib.md5(image.tobytes()).hexdigest() for image in loaded_images]
-    image_filenames = []
-    for image, hash_str in zip(loaded_images, images_hash):
-        t = datetime.datetime.now()
-        filename = os.path.join(
-            "serve_images",
-            f"{hash_str}.jpg",
-        )
+    conv.save_new_images(
+        has_csam_images=state.has_csam_image, use_remote_storage=use_remote_storage
+    )
 
-        if use_remote_storage:
-            image_url = upload_image_file_to_gcs(image, filename)
-            image_filenames.append(image_url)
-        else:
-            filename = os.path.join(LOGDIR, filename)
-            if not os.path.isfile(filename):
-                os.makedirs(os.path.dirname(filename), exist_ok=True)
-                image.save(filename)
-
-            image_filenames.append(hash_str)
-
-    filename = get_conv_log_filename()
-    if "llava" in model_name:
-        filename = filename.replace("2024", "vision-tmp-2024")
+    filename = get_conv_log_filename(
+        is_vision=state.is_vision, has_csam_image=state.has_csam_image
+    )
 
     with open(filename, "a") as fout:
         data = {
@@ -604,64 +583,25 @@ def bot_response(
             "finish": round(finish_tstamp, 4),
             "state": state.dict(),
             "ip": get_ip(request),
-            "images": image_filenames,
         }
         fout.write(json.dumps(data) + "\n")
     get_remote_logger().log(data)
 
 
 block_css = """
-#notice_markdown .prose {
-    font-size: 110% !important;
-}
-#notice_markdown th {
-    display: none;
-}
-#notice_markdown td {
-    padding-top: 6px;
-    padding-bottom: 6px;
-}
-#arena_leaderboard_dataframe table {
-    font-size: 110%;
-}
-#full_leaderboard_dataframe table {
-    font-size: 110%;
-}
-#model_description_markdown {
-    font-size: 110% !important;
-}
-#leaderboard_markdown .prose {
-    font-size: 110% !important;
-}
-#leaderboard_markdown td {
-    padding-top: 6px;
-    padding-bottom: 6px;
-}
-#leaderboard_dataframe td {
-    line-height: 0.1em;
-}
-#about_markdown .prose {
-    font-size: 110% !important;
-}
-#ack_markdown .prose {
-    font-size: 110% !important;
-}
-#chatbot .prose {
+.prose {
     font-size: 105% !important;
 }
-.sponsor-image-about img {
-    margin: 0 20px;
-    margin-top: 20px;
-    height: 40px;
-    max-height: 100%;
-    width: auto;
-    float: left;
+
+#arena_leaderboard_dataframe table {
+    font-size: 105%;
+}
+#full_leaderboard_dataframe table {
+    font-size: 105%;
 }
 
-.chatbot h1, h2, h3 {
-    margin-top: 8px; /* Adjust the value as needed */
-    margin-bottom: 0px; /* Adjust the value as needed */
-    padding-bottom: 0px;
+.tab-nav button {
+    font-size: 18px;
 }
 
 .chatbot h1 {
@@ -673,12 +613,18 @@ block_css = """
 .chatbot h3 {
     font-size: 110%;
 }
-.chatbot p:not(:first-child) {
-    margin-top: 8px;
+
+#chatbot .prose {
+    font-size: 90% !important;
 }
 
-.typing {
-    display: inline-block;
+.sponsor-image-about img {
+    margin: 0 20px;
+    margin-top: 20px;
+    height: 40px;
+    max-height: 100%;
+    width: auto;
+    float: left;
 }
 
 .cursor {
@@ -706,7 +652,8 @@ block_css = """
 
 .app {
   max-width: 100% !important;
-  padding: 20px !important;               
+  padding-left: 5% !important;
+  padding-right: 5% !important;
 }
 
 a {
@@ -718,6 +665,84 @@ a:hover {
     text-decoration: underline; /* Adds underline on hover */
 }
 """
+
+
+# block_css = """
+# #notice_markdown .prose {
+#     font-size: 110% !important;
+# }
+# #notice_markdown th {
+#     display: none;
+# }
+# #notice_markdown td {
+#     padding-top: 6px;
+#     padding-bottom: 6px;
+# }
+# #arena_leaderboard_dataframe table {
+#     font-size: 110%;
+# }
+# #full_leaderboard_dataframe table {
+#     font-size: 110%;
+# }
+# #model_description_markdown {
+#     font-size: 110% !important;
+# }
+# #leaderboard_markdown .prose {
+#     font-size: 110% !important;
+# }
+# #leaderboard_markdown td {
+#     padding-top: 6px;
+#     padding-bottom: 6px;
+# }
+# #leaderboard_dataframe td {
+#     line-height: 0.1em;
+# }
+# #about_markdown .prose {
+#     font-size: 110% !important;
+# }
+# #ack_markdown .prose {
+#     font-size: 110% !important;
+# }
+# #chatbot .prose {
+#     font-size: 105% !important;
+# }
+# .sponsor-image-about img {
+#     margin: 0 20px;
+#     margin-top: 20px;
+#     height: 40px;
+#     max-height: 100%;
+#     width: auto;
+#     float: left;
+# }
+
+# body {
+#     --body-text-size: 14px;
+# }
+
+# .chatbot h1, h2, h3 {
+#     margin-top: 8px; /* Adjust the value as needed */
+#     margin-bottom: 0px; /* Adjust the value as needed */
+#     padding-bottom: 0px;
+# }
+
+# .chatbot h1 {
+#     font-size: 130%;
+# }
+# .chatbot h2 {
+#     font-size: 120%;
+# }
+# .chatbot h3 {
+#     font-size: 110%;
+# }
+# .chatbot p:not(:first-child) {
+#     margin-top: 8px;
+# }
+
+# .typing {
+#     display: inline-block;
+# }
+
+# """
 
 
 def get_model_description_md(models):
@@ -749,11 +774,9 @@ def build_about():
 Chatbot Arena is an open-source research project developed by members from [LMSYS](https://lmsys.org) and UC Berkeley [SkyLab](https://sky.cs.berkeley.edu/). Our mission is to build an open platform to evaluate LLMs by human preference in the real-world.
 We open-source our [FastChat](https://github.com/lm-sys/FastChat) project at GitHub and release chat and human feedback dataset. We invite everyone to join us!
 
-## Arena Core Team
-- [Lianmin Zheng](https://lmzheng.net/) (co-lead), [Wei-Lin Chiang](https://infwinston.github.io/) (co-lead), [Ying Sheng](https://sites.google.com/view/yingsheng/home), [Joseph E. Gonzalez](https://people.eecs.berkeley.edu/~jegonzal/), [Ion Stoica](http://people.eecs.berkeley.edu/~istoica/)
-
-## Past Members
-- [Siyuan Zhuang](https://scholar.google.com/citations?user=KSZmI5EAAAAJ), [Hao Zhang](https://cseweb.ucsd.edu/~haozhang/)
+## Open-source contributors
+- [Wei-Lin Chiang](https://infwinston.github.io/), [Lianmin Zheng](https://lmzheng.net/), [Ying Sheng](https://sites.google.com/view/yingsheng/home), [Lisa Dunlap](https://www.lisabdunlap.com/), [Anastasios Angelopoulos](https://people.eecs.berkeley.edu/~angelopoulos/), [Christopher Chou](https://www.linkedin.com/in/chrisychou), [Tianle Li](https://codingwithtim.github.io/), [Siyuan Zhuang](https://www.linkedin.com/in/siyuanzhuang)
+- Advisors: [Ion Stoica](http://people.eecs.berkeley.edu/~istoica/), [Joseph E. Gonzalez](https://people.eecs.berkeley.edu/~jegonzal/), [Hao Zhang](https://cseweb.ucsd.edu/~haozhang/), [Trevor Darrell](https://people.eecs.berkeley.edu/~trevor/)
 
 ## Learn more
 - Chatbot Arena [paper](https://arxiv.org/abs/2403.04132), [launch blog](https://lmsys.org/blog/2023-05-03-arena/), [dataset](https://github.com/lm-sys/FastChat/blob/main/docs/dataset_release.md), [policy](https://lmsys.org/blog/2024-03-01-policy/)
@@ -766,7 +789,7 @@ We open-source our [FastChat](https://github.com/lm-sys/FastChat) project at Git
 
 ## Acknowledgment
 We thank [SkyPilot](https://github.com/skypilot-org/skypilot) and [Gradio](https://github.com/gradio-app/gradio) team for their system support.
-We also thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https://www.kaggle.com/), [MBZUAI](https://mbzuai.ac.ae/), [a16z](https://www.a16z.com/), [Together AI](https://www.together.ai/), [Hyperbolic](https://hyperbolic.xyz/), [Anyscale](https://www.anyscale.com/), [HuggingFace](https://huggingface.co/) for their generous sponsorship. Learn more about partnership [here](https://lmsys.org/donations/).
+We also thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https://www.kaggle.com/), [MBZUAI](https://mbzuai.ac.ae/), [a16z](https://www.a16z.com/), [Together AI](https://www.together.ai/), [Hyperbolic](https://hyperbolic.xyz/), [RunPod](https://runpod.io), [Anyscale](https://www.anyscale.com/), [HuggingFace](https://huggingface.co/) for their generous sponsorship. Learn more about partnership [here](https://lmsys.org/donations/).
 
 <div class="sponsor-image-about">
     <img src="https://storage.googleapis.com/public-arena-asset/skylab.png" alt="SkyLab">
@@ -775,6 +798,7 @@ We also thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https
     <img src="https://storage.googleapis.com/public-arena-asset/a16z.jpeg" alt="a16z">
     <img src="https://storage.googleapis.com/public-arena-asset/together.png" alt="Together AI">
     <img src="https://storage.googleapis.com/public-arena-asset/hyperbolic_logo.png" alt="Hyperbolic">
+    <img src="https://storage.googleapis.com/public-arena-asset/runpod-logo.jpg" alt="RunPod">
     <img src="https://storage.googleapis.com/public-arena-asset/anyscale.png" alt="AnyScale">
     <img src="https://storage.googleapis.com/public-arena-asset/huggingface.png" alt="HuggingFace">
 </div>
@@ -785,18 +809,16 @@ We also thank [UC Berkeley SkyLab](https://sky.cs.berkeley.edu/), [Kaggle](https
 def build_single_model_ui(models, add_promotion_links=False):
     promotion = (
         """
-- | [GitHub](https://github.com/lm-sys/FastChat) | [Dataset](https://github.com/lm-sys/FastChat/blob/main/docs/dataset_release.md) | [Twitter](https://twitter.com/lmsysorg) | [Discord](https://discord.gg/HSWAKCrnFx) |
-- Introducing Llama 2: The Next Generation Open Source Large Language Model. [[Website]](https://ai.meta.com/llama/)
-- Vicuna: An Open-Source Chatbot Impressing GPT-4 with 90% ChatGPT Quality. [[Blog]](https://lmsys.org/blog/2023-03-30-vicuna/)
+[Blog](https://lmsys.org/blog/2023-05-03-arena/) | [GitHub](https://github.com/lm-sys/FastChat) | [Paper](https://arxiv.org/abs/2403.04132) | [Dataset](https://github.com/lm-sys/FastChat/blob/main/docs/dataset_release.md) | [Twitter](https://twitter.com/lmsysorg) | [Discord](https://discord.gg/HSWAKCrnFx) | [Kaggle Competition](https://www.kaggle.com/competitions/lmsys-chatbot-arena)
 
-## 🤖 Choose any model to chat
+## 👇 Choose any model to chat
 """
         if add_promotion_links
         else ""
     )
 
     notice_markdown = f"""
-# 🏔️ Chat with Open Large Language Models
+# 🏔️ Chat with Large Language Models
 {promotion}
 """
 
@@ -823,7 +845,7 @@ def build_single_model_ui(models, add_promotion_links=False):
         chatbot = gr.Chatbot(
             elem_id="chatbot",
             label="Scroll down and start chatting",
-            height=550,
+            height=650,
             show_copy_button=True,
         )
     with gr.Row():
@@ -871,7 +893,6 @@ def build_single_model_ui(models, add_promotion_links=False):
         gr.Markdown(acknowledgment_md, elem_id="ack_markdown")
 
     # Register listeners
-    imagebox = gr.State(None)
     btn_list = [upvote_btn, downvote_btn, flag_btn, regenerate_btn, clear_btn]
     upvote_btn.click(
         upvote_last_response,
@@ -888,23 +909,19 @@ def build_single_model_ui(models, add_promotion_links=False):
         [state, model_selector],
         [textbox, upvote_btn, downvote_btn, flag_btn],
     )
-    regenerate_btn.click(
-        regenerate, state, [state, chatbot, textbox, imagebox] + btn_list
-    ).then(
+    regenerate_btn.click(regenerate, state, [state, chatbot, textbox] + btn_list).then(
         bot_response,
         [state, temperature, top_p, max_output_tokens],
         [state, chatbot] + btn_list,
     )
-    clear_btn.click(clear_history, None, [state, chatbot, textbox, imagebox] + btn_list)
+    clear_btn.click(clear_history, None, [state, chatbot, textbox] + btn_list)
 
-    model_selector.change(
-        clear_history, None, [state, chatbot, textbox, imagebox] + btn_list
-    )
+    model_selector.change(clear_history, None, [state, chatbot, textbox] + btn_list)
 
     textbox.submit(
         add_text,
-        [state, model_selector, textbox, imagebox],
-        [state, chatbot, textbox, imagebox] + btn_list,
+        [state, model_selector, textbox],
+        [state, chatbot, textbox] + btn_list,
     ).then(
         bot_response,
         [state, temperature, top_p, max_output_tokens],
@@ -912,8 +929,8 @@ def build_single_model_ui(models, add_promotion_links=False):
     )
     send_btn.click(
         add_text,
-        [state, model_selector, textbox, imagebox],
-        [state, chatbot, textbox, imagebox] + btn_list,
+        [state, model_selector, textbox],
+        [state, chatbot, textbox] + btn_list,
     ).then(
         bot_response,
         [state, temperature, top_p, max_output_tokens],
@@ -1019,7 +1036,7 @@ if __name__ == "__main__":
     # Set global variables
     set_global_vars(args.controller_url, args.moderate, args.use_remote_storage)
     models, all_models = get_model_list(
-        args.controller_url, args.register_api_endpoint_file, False
+        args.controller_url, args.register_api_endpoint_file, vision_arena=False
     )
 
     # Set authorization credentials
